@@ -5,6 +5,7 @@ use std::{
     future::Future,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Wake, Waker},
+    time::Duration,
 };
 
 #[cfg(feature = "macro")]
@@ -24,6 +25,25 @@ pub trait FutureExt: Future {
     /// let result = my_fut.block_on();
     /// ```
     fn block_on(self) -> Self::Output where Self: Sized { block_on(self) }
+
+    /// Block the thread until the future is ready or the timeout elapses.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pollster::FutureExt as _;
+    ///
+    /// let my_fut = std::future::pending::<()>();
+    ///
+    /// let result = my_fut.block_on_timeout(std::time::Duration::from_secs(1));
+    /// assert_eq!(result, None);
+    /// ```
+    fn block_on_timeout(self, timeout: Duration) -> Option<Self::Output>
+    where
+        Self: Sized
+    {
+        block_on_timeout(self, timeout)
+    }
 }
 
 impl<F: Future> FutureExt for F {}
@@ -47,7 +67,7 @@ impl Signal {
         }
     }
 
-    fn wait(&self) {
+    fn wait(&self, timeout: Option<Duration>) -> bool {
         let mut state = self.state.lock().unwrap();
         match *state {
             // Notify() was called before we got here, consume it here without waiting and return immediately.
@@ -64,10 +84,20 @@ impl Signal {
                 // loop prevents incorrect spurious wakeups.
                 *state = SignalState::Waiting;
                 while let SignalState::Waiting = *state {
-                    state = self.cond.wait(state).unwrap();
+                    if let Some(timeout) = timeout {
+                        let (state2, result) = self.cond.wait_timeout(state, timeout).unwrap();
+                        state = state2;
+                        if result.timed_out() {
+                            *state = SignalState::Empty;
+                            return true;
+                        }
+                    } else {
+                        state = self.cond.wait(state).unwrap();
+                    }
                 }
             }
         }
+        false
     }
 
     fn notify(&self) {
@@ -108,7 +138,28 @@ impl Wake for Signal {
 /// let my_fut = async {};
 /// let result = pollster::block_on(my_fut);
 /// ```
-pub fn block_on<F: Future>(mut fut: F) -> F::Output {
+pub fn block_on<F: Future>(fut: F) -> F::Output {
+    block_on_inner(fut, None).unwrap()
+}
+
+/// Block the thread until the future is ready or the timeout elapses.
+///
+/// # Example
+///
+/// ```
+/// let my_fut = async { 1 };
+/// let result = pollster::block_on_timeout(my_fut, std::time::Duration::from_secs(1));
+/// assert_eq!(result, Some(1));
+///
+/// let my_fut = std::future::pending::<()>();
+/// let result = pollster::block_on_timeout(my_fut, std::time::Duration::from_secs(1));
+/// assert_eq!(result, None);
+/// ```
+pub fn block_on_timeout<F: Future>(fut: F, timeout: Duration) -> Option<F::Output> {
+    block_on_inner(fut, Some(timeout))
+}
+
+fn block_on_inner<F: Future>(mut fut: F, timeout: Option<Duration>) -> Option<F::Output> {
     // Pin the future so that it can be polled.
     // SAFETY: We shadow `fut` so that it cannot be used again. The future is now pinned to the stack and will not be
     // moved until the end of this scope. This is, incidentally, exactly what the `pin_mut!` macro from `pin_utils`
@@ -128,8 +179,8 @@ pub fn block_on<F: Future>(mut fut: F) -> F::Output {
     // Poll the future to completion
     loop {
         match fut.as_mut().poll(&mut context) {
-            Poll::Pending => signal.wait(),
-            Poll::Ready(item) => break item,
+            Poll::Pending => if signal.wait(timeout) { break None },
+            Poll::Ready(item) => break Some(item),
         }
     }
 }
