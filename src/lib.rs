@@ -139,7 +139,7 @@ impl Wake for Signal {
 /// let result = pollster::block_on(my_fut);
 /// ```
 pub fn block_on<F: Future>(fut: F) -> F::Output {
-    block_on_inner(fut, None).unwrap()
+    block_on_inner(fut, None).expect("Future blocked on without timeout timed out: Open a bug report!")
 }
 
 /// Block the thread until the future is ready or the timeout elapses.
